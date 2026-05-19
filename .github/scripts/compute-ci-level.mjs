@@ -7,15 +7,17 @@
 // tier-0 cheap checks and wait for ALLGREEN to fire.
 //
 // Three levels:
-//   tier-0  cheap checks (fmt, build sanity) — always runs
-//   tier-1  basic OS matrix + light integration tests — merge queue, labeled PRs
-//   tier-2  full deep matrix — merge queue tip only (or forced)
+//   tier-0  cheap checks only (validate)           — always runs
+//   tier-1  build matrix, no integration           — ci/tier-1 label, labeled PRs
+//   tier-2  build + full integration matrix        — merge queue tip only (or forced)
 //
 // Outputs (via GITHUB_OUTPUT):
-//   ci_level             - "tier-0" | "tier-1" | "tier-2"
-//   reason               - human-readable explanation
-//   build_os_matrix      - JSON array of OS names (tier-1+)
-//   integration_os_matrix - JSON array of OS names (tier-2 only)
+//   ci_level              - "tier-0" | "tier-1" | "tier-2"  (informational, for summaries)
+//   reason                - human-readable explanation of why this level was chosen
+//   build_os_matrix       - JSON array of OS names; "[]" means skip the build job
+//   integration_os_matrix - JSON array of OS names; "[]" means skip test-integration
+//
+// Jobs gate on the matrix outputs (empty array → skipped), not on ci_level directly.
 //
 // Usage: node compute-ci-level.mjs
 // Required env: GITHUB_OUTPUT, GITHUB_SHA, GITHUB_REPOSITORY,

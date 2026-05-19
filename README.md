@@ -1,94 +1,170 @@
 # merge-queue-like-bors
 
-A demonstration of running GitHub's merge queue like [bors](https://github.com/rust-lang/bors): expensive CI only runs once, on the tip of the queue batch.
-
-AI note: This project and text has substantial generation from AI, but has been
-reviewed by @cgwalters.
+A demonstration of running GitHub's merge queue like [bors](https://github.com/rust-lang/bors):
+expensive CI runs once, on the tip of the queue batch, not on every PR individually.
 
 ## The problem
 
-[Bors](https://github.com/rust-lang/bors) was created to solve a simple problem:
-ensuring that tip-of-tree is always green (solving the "PR 1 and 2 pass independently,
-but break when merged together problem).
+[Bors](https://github.com/rust-lang/bors) was created to ensure tip-of-tree is always green
+(the "PR 1 and PR 2 pass individually but break when merged together" problem), and to batch
+CI: running expensive jobs once across a group of PRs rather than once per PR.
 
-It also implements "CI batching", running expensive CI jobs on multiple PRs
-at once and merging them together.
-
-Later, Github added merge queues, but merge queues run *all* tests on each PR,
-so if you have expensive CI, it adds up quickly.
+GitHub's native merge queue solves the first problem but not the second — it runs the full
+test suite on every queue entry independently, which can be very expensive.
 
 ## The insight
 
-In a merge queue run, we can detect the "tip" commit that rolls in all
-the other changes, and run expensive CI jobs just on that one.
+In a merge queue run, we can detect the "tip" commit — the one that incorporates all the
+other pending changes — and run expensive CI jobs only on that one. Non-tip entries run only
+cheap checks and wait for ALLGREEN.
 
-Then we get all the benefits of bors-like batching with no external bot.
+This gives all the benefits of bors-style batching with no external bot.
 
 ## Requirements
 
-**This only works with ALLGREEN grouping** (GitHub's "Group pull requests" merge
-queue setting). Under ALLGREEN, GitHub waits for *all* queue entries to pass
-required checks before merging the group. Non-tip entries finish quickly (cheap
-tests only) and wait; the tip runs the full suite; when it passes, everything
-merges together.
+**The merge queue MUST use ALLGREEN grouping** ("Group pull requests" in GitHub merge queue
+settings). Under ALLGREEN, GitHub waits for *all* queue entries to pass required checks before
+merging the group. Non-tip entries finish their cheap checks quickly and wait; the tip runs the
+full suite; when it passes, the whole batch merges together.
 
-Under HEADMERGE ("Merge independently"), each PR merges the moment it
-individually passes — so non-tip entries would merge having only passed cheap
-tests, defeating the purpose entirely.
+Under HEADMERGE ("Merge independently"), each PR merges the moment it individually passes —
+non-tip entries would merge having only run cheap checks, defeating the purpose.
 
-## How it works in the workflow
+## How it works
 
-The `compute-ci-level` job detects its queue position and sets `run_heavy`
-accordingly. All downstream expensive jobs are gated on `run_heavy == 'true'`.
+### CI tiers
+
+Three tiers of jobs run depending on context:
+
+| Tier | Jobs | When |
+|------|------|------|
+| 0 | `validate` (cheap checks) | Every PR, every merge queue entry |
+| 1 | `build` matrix | `ci/tier-1` labeled PRs; `ci/merge`; forced runs; merge queue tip |
+| 2 | `test-integration` matrix | Merge queue tip only (or forced) |
+
+The `compute-ci-level` job queries the GitHub GraphQL API to detect whether the current
+merge queue entry is the tip, then sets the `build_os_matrix` and `integration_os_matrix`
+outputs that downstream jobs gate on. Jobs with an empty matrix are skipped, and GitHub
+counts skipped as passing for required-checks purposes.
+
+### Flow
 
 ```
-merge_group event fires for each queue entry
+merge_group fires for each queue entry
         │
         ▼
 compute-ci-level
-  ├─ query mergeQueue(last: 1).headCommit.oid
+  ├─ query mergeQueue(last: 1).headCommit.oid  (GraphQL API)
   ├─ compare to $GITHUB_SHA
-  ├─ if match (or API failure): run_heavy=true
-  └─ if no match: run_heavy=false
+  ├─ if match (or API failure): tier-2  (full suite)
+  └─ if no match:               tier-0  (cheap checks only)
         │
-        ├─ validate, docs, cargo-deny   ← always run (cheap, ~minutes)
+        ├─ validate                 ← always, ~seconds
         │
-        └─ [if run_heavy]
-           ├─ package matrix
-           ├─ test-integration matrix   ← expensive, hours
-           ├─ test-upgrade matrix
-           └─ test-container-export
+        ├─ build (matrix)           ← tier-1+, skipped otherwise
+        │
+        └─ test-integration (matrix) ← tier-2 only, depends on build
 ```
 
-With 4 PRs in the queue:
+With 4 PRs in the queue (ALLGREEN mode):
 
 ```
-PR #1  [not tip]: validate ✓  docs ✓  cargo-deny ✓  integration: skipped  → done in 2min
-PR #2  [not tip]: validate ✓  docs ✓  cargo-deny ✓  integration: skipped  → done in 2min
-PR #3  [not tip]: validate ✓  docs ✓  cargo-deny ✓  integration: skipped  → done in 2min
-PR #4  [tip]:     validate ✓  docs ✓  cargo-deny ✓  integration: ✓✓✓...   → done in 3hr
-                                                                            ↓
-                                                               all 4 PRs merge
+PR #1  [not tip]: validate ✓  build: skip  integration: skip  → done in ~30s
+PR #2  [not tip]: validate ✓  build: skip  integration: skip  → done in ~30s
+PR #3  [not tip]: validate ✓  build: skip  integration: skip  → done in ~30s
+PR #4  [tip]:     validate ✓  build ✓  integration ✓✓✓...    → done in Xhr
+                                                              ↓
+                                                   all 4 PRs merge together
 ```
 
-## Race conditions
+### The sentinel jobs
+
+Two sentinel jobs coordinate required-checks in a way that keeps PRs unblocked while
+still enforcing the full suite in the merge queue.
+
+**The problem they solve:** The `ci/merge` label triggers the full tier-2 suite on a PR for
+early feedback. With a single sentinel gating all jobs, a flaky heavy job would block the PR
+from even entering the merge queue — where those jobs run fresh anyway. Package artifacts
+expire, retries are expensive, and the merge queue itself is the right place for the full gate.
+
+**The solution:**
+
+```
+required-checks-merge  ← if: merge_group || workflow_dispatch
+  needs: [all jobs]       (skipped on pull_request → result = "skipped")
+        │
+        ▼
+required-checks        ← if: always()
+  needs: [validate, compute-ci-level, required-checks-merge]
+```
+
+- On a **PR**: `required-checks-merge` is skipped (condition false). `required-checks` sees
+  `skipped` which counts as success, so only `validate` gates the PR. Heavy jobs from a
+  `ci/merge` label run for feedback but don't block merge-queue entry.
+
+- In the **merge queue**: `required-checks-merge` runs with `always()` so it executes even
+  when upstream jobs failed, checks every job, and fails if anything broke. `required-checks`
+  then picks up that failure.
+
+Configure **only `required-checks`** as the required status check in repository settings.
+No separate merge-queue required check configuration is needed.
+
+### Race conditions
 
 All safe:
 
-- **New PR added while tip is running**: the old tip already started the full
-  suite. The new PR becomes the new tip and also runs the full suite. You get one
-  extra full run during overlap — acceptable.
+- **New PR added while tip is running**: the original tip already started the full suite.
+  The new PR becomes the new tip and also starts the full suite. You get one extra full run
+  during overlap — acceptable.
 
-- **Tip is kicked out of the queue**: GitHub rebuilds the queue with new commits
-  (new SHAs). The new tip's CI triggers fresh, detects itself as tip, runs full
-  suite. The previous non-tip entries that ran only cheap tests never merge
-  (ALLGREEN holds everything until the full suite passes).
+- **Tip is kicked out of the queue**: GitHub rebuilds the queue with new commits (new SHAs).
+  The new tip detects itself as tip, runs the full suite. The previous non-tip entries that
+  ran only cheap tests never merge (ALLGREEN holds everything until the full suite passes).
 
-## The workflow
+## Repository setup checklist
 
-See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full
-annotated example. The critical section is the `merge_group` branch of
-`compute-ci-level`.
+1. **Merge queue**: Settings → Merge queue → Grouping strategy: **ALLGREEN**
+2. **Required status check**: Settings → Rules → Required status checks → add `required-checks`
+3. **Labels**: Create `ci/merge` (triggers full tier-2 on a PR) and `ci/tier-1` (tier-1 only)
+
+## Adapting this to your project
+
+The files to copy and modify:
+
+- **`.github/scripts/compute-ci-level.mjs`** — edit the `TIER1` and `TIER2` OS matrix
+  constants at the top to match your actual build targets. Everything else is generic.
+- **`.github/workflows/ci.yml`** — replace the stub `validate`, `build`, and
+  `test-integration` jobs with your real CI steps. Keep the `compute-ci-level` job and
+  both sentinel jobs unchanged.
+
+The `ci_level` output from `compute-ci-level` is written to the step summary for human
+readability but is not used directly by job `if:` conditions. Jobs gate on
+`build_os_matrix != '[]'` and `integration_os_matrix != '[]'` instead, since an empty
+JSON array is the natural "skip this matrix job" signal in GitHub Actions.
+
+## Files
+
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — the annotated workflow
+- [`.github/scripts/compute-ci-level.mjs`](.github/scripts/compute-ci-level.mjs) — tip
+  detection logic with inline documentation
+- [`ci/`](ci/) — sandbox test fixtures (see below)
+
+## Sandbox test fixtures
+
+The `ci/` directory contains empty sentinel files used to simulate CI failures without
+modifying the workflow. These are specific to this demo repo and would not exist in a real
+project.
+
+| File | Effect |
+|------|--------|
+| `ci/fail-validate` | Makes the `validate` job exit 1 (tier-0 failure, blocks PR) |
+| `ci/fail-build` | Makes the `build` job exit 1 (tier-1 failure) |
+| `ci/fail-integration` | Makes the `test-integration` job exit 1 (tier-2 failure) |
+
+These were used to verify the sentinel behavior live against `bootc-dev/ci-sandbox`:
+- A plain PR (no files) → `required-checks` green immediately
+- A PR with `ci/merge` + `ci/fail-build` → `build` fails but `required-checks` still green (PR can be queued); in the merge queue `required-checks-merge` catches the failure and blocks
+- A PR with `ci/fail-validate` → `validate` fails, `required-checks` red, PR blocked
 
 ## License
 

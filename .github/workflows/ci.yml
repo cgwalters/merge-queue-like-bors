@@ -1,19 +1,17 @@
 name: CI
 
-# This workflow demonstrates bors-like merge queue batching using GitHub's
-# native merge queue. Three tiers of jobs run depending on context:
+# Bors-like CI batching via GitHub's native merge queue.
 #
-#   tier-0  cheap checks (fmt, build sanity) — every PR, every queue entry
-#   tier-1  build matrix across OSes — labeled PRs (ci/tier-1), forced runs
-#   tier-2  full integration matrix — merge queue tip only (or forced)
+# See README.md for full design documentation. Summary:
 #
-# Non-tip queue entries run only tier-0 and then wait for the tip (which runs
-# the full suite) to get ALLGREEN before anything merges. This mirrors bors
-# semantics: the full suite runs once on the combined batch, not per-PR.
+#   tier-0  validate (cheap)      — every PR, every queue entry
+#   tier-1  build matrix          — ci/tier-1 label, ci/merge label, merge queue tip
+#   tier-2  test-integration      — merge queue tip only (or forced)
 #
-# REQUIREMENT: The merge queue MUST use ALLGREEN grouping ("Group pull
-# requests" in GitHub settings). Under HEADMERGE, non-tip entries would merge
-# immediately after passing cheap tests, bypassing the full suite entirely.
+# Non-tip queue entries run tier-0 only, then wait for the tip to pass the
+# full suite under ALLGREEN before anything merges.
+#
+# REQUIREMENT: merge queue must use ALLGREEN grouping, not HEADMERGE.
 
 permissions:
   actions: read
@@ -33,15 +31,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Determines what to run based on event context. See the annotated logic in
-  # .github/scripts/compute-ci-level.mjs for full details.
+  # Detects queue position and sets build_os_matrix / integration_os_matrix.
+  # An empty matrix ("[]") causes the downstream job to be skipped, which counts
+  # as passing for required-checks purposes.
   #
-  #   merge_group + tip of queue:    ci_level=tier-2  (full suite)
-  #   merge_group + not tip:         ci_level=tier-0  (cheap only, wait for tip)
-  #   merge_group + API failure:     ci_level=tier-2  (fail-safe)
-  #   workflow_dispatch / ci/merge:  ci_level=tier-2
-  #   PR with ci/tier-1 label:       ci_level=tier-1  (build matrix, no integration)
-  #   plain PR:                      ci_level=tier-0
+  # Decision table:
+  #   merge_group + tip of queue:    tier-2  (full suite)
+  #   merge_group + not tip:         tier-0  (cheap only — wait for tip)
+  #   merge_group + API failure:     tier-2  (fail-safe: assume tip)
+  #   workflow_dispatch / ci/merge:  tier-2
+  #   PR with ci/tier-1 label:       tier-1  (build matrix, no integration)
+  #   plain PR:                      tier-0
+  #
+  # See .github/scripts/compute-ci-level.mjs for the GraphQL tip-detection logic.
   compute-ci-level:
     runs-on: ubuntu-latest
     outputs:
@@ -58,24 +60,21 @@ jobs:
           LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
         run: node .github/scripts/compute-ci-level.mjs
 
-  # ── Tier-0: cheap checks, always run ─────────────────────────────────────
-  # Touch ci/fail-validate in the branch to simulate a tier-0 failure.
+  # ── Tier-0: cheap checks, always run ──────────────────────────────────────
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: fmt check
+        # Sandbox: touch ci/fail-validate to simulate a tier-0 failure.
         run: |
           if [ -f ci/fail-validate ]; then
-            echo "Simulated validate failure (ci/fail-validate present)"
-            exit 1
+            echo "Simulated validate failure (ci/fail-validate present)"; exit 1
           fi
           echo "fmt check passed"
 
-  # ── Tier-1: build matrix (labeled PRs, forced runs, merge queue tip) ──────
-  # Skipped on plain PRs and non-tip queue entries. "skipped" counts as
-  # passing for required-checks purposes.
-  # Touch ci/fail-build in the branch to simulate a tier-1 failure.
+  # ── Tier-1: build matrix ───────────────────────────────────────────────────
+  # Skipped when build_os_matrix is empty (plain PR, non-tip queue entry).
   build:
     if: needs.compute-ci-level.outputs.build_os_matrix != '[]'
     needs: compute-ci-level
@@ -87,15 +86,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: build
+        # Sandbox: touch ci/fail-build to simulate a tier-1 failure.
         run: |
           if [ -f ci/fail-build ]; then
-            echo "Simulated build failure (ci/fail-build present)"
-            exit 1
+            echo "Simulated build failure (ci/fail-build present)"; exit 1
           fi
           echo "build on ${{ matrix.os }} passed"
 
-  # ── Tier-2: integration matrix (merge queue tip or forced only) ───────────
-  # Touch ci/fail-integration in the branch to simulate a tier-2 failure.
+  # ── Tier-2: integration matrix ─────────────────────────────────────────────
+  # Only runs when integration_os_matrix is non-empty (merge queue tip or forced).
   test-integration:
     if: needs.compute-ci-level.outputs.integration_os_matrix != '[]'
     needs: [compute-ci-level, build]
@@ -108,26 +107,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: integration test
+        # Sandbox: touch ci/fail-integration to simulate a tier-2 failure.
         run: |
           if [ -f ci/fail-integration ]; then
-            echo "Simulated integration failure (ci/fail-integration present)"
-            exit 1
+            echo "Simulated integration failure (ci/fail-integration present)"; exit 1
           fi
           echo "integration test (${{ matrix.build_type }}) on ${{ matrix.os }} passed"
 
   # ── Sentinels ─────────────────────────────────────────────────────────────
   #
-  # Two-job sentinel pattern so that the ci/merge label (which triggers tier-2
-  # on a PR for early feedback) does not block merge-queue entry if a heavy job
-  # flakes.  RPM/package artifacts expire quickly and re-runs are expensive, so
-  # we want the merge queue to re-run those jobs fresh rather than requiring
-  # them to be green before the PR can even be queued.
+  # See README.md "The sentinel jobs" section for full design rationale.
+  # Short version: two sentinels let a PR enter the merge queue even if a
+  # ci/merge-triggered heavy job flaked, while still blocking actual merges
+  # if the full suite fails in the merge queue.
   #
-  #   required-checks-merge  — gates the full suite; only runs in merge_group /
-  #                            workflow_dispatch; skipped on plain PRs.
-  #   required-checks        — the single name to configure in repo settings;
-  #                            gates tier-0 jobs + required-checks-merge (which
-  #                            is "skipped" == success on PRs).
+  # required-checks-merge: runs in merge_group/workflow_dispatch only.
+  #   - Gates the full suite (all tiers).
+  #   - Skipped on pull_request → result is "skipped".
+  #   - Uses always() so it runs even when upstream jobs failed, ensuring
+  #     the failure is reported rather than the job being skipped.
   #
   required-checks-merge:
     if: ${{ always() && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
@@ -145,7 +143,12 @@ jobs:
           fi
           echo "All jobs succeeded or were skipped."
 
-  # Configure "required-checks" as the required status check in repo settings.
+  # required-checks: configure THIS name as the required status check in repo settings.
+  #   - On PRs: required-checks-merge is "skipped" (counts as success), so only
+  #     validate gates the PR. Heavy jobs from ci/merge label don't block queue entry.
+  #   - In merge queue: required-checks-merge has already run above and will have
+  #     failed if anything was broken, so required-checks picks that up.
+  #
   required-checks:
     if: always()
     needs: [compute-ci-level, validate, required-checks-merge]
