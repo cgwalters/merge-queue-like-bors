@@ -11,6 +11,9 @@
 //   tier-1  build matrix, no integration           — ci/tier-1 label, labeled PRs
 //   tier-2  build + full integration matrix        — merge queue tip only (or forced)
 //
+// The tip's own ci/skip label is an opt-out: even as tip, a PR labeled
+// ci/skip runs tier-0 only instead of tier-2 (e.g. docs-only changes).
+//
 // Outputs (via GITHUB_OUTPUT):
 //   ci_level              - "tier-0" | "tier-1" | "tier-2"  (informational, for summaries)
 //   reason                - human-readable explanation of why this level was chosen
@@ -89,13 +92,20 @@ function setSummaryTable(sha, tipOid, isTip) {
 
 // ── Queue tip detection ───────────────────────────────────────────────────────
 
+// Fetches the tip entry's commit oid and the labels on its underlying pull
+// request (used for the `ci/skip` opt-out — see main()). Both come from the
+// same query so detecting "am I the tip" and "does the tip want to skip
+// heavy CI" costs a single API round trip.
 async function fetchQueueTip(owner, repo, branch) {
   const query = `
     query($owner: String!, $repo: String!, $branch: String!) {
       repository(owner: $owner, name: $repo) {
         mergeQueue(branch: $branch) {
           entries(last: 1) {
-            nodes { headCommit { oid } }
+            nodes {
+              headCommit { oid }
+              pullRequest { labels(first: 100) { nodes { name } } }
+            }
           }
         }
       }
@@ -126,7 +136,14 @@ async function fetchQueueTip(owner, repo, branch) {
     throw new Error("Empty or missing mergeQueue entries in response");
   }
 
-  return nodes[0].headCommit.oid;
+  const tipOid = nodes[0].headCommit.oid;
+  // Defensive default: if the pullRequest/labels fields are ever null (e.g.
+  // schema change, permissions), treat it as "no labels" rather than
+  // throwing. Missing ci/skip just means we fall through to the full suite,
+  // which matches the fail-safe philosophy below.
+  const tipLabels = nodes[0].pullRequest?.labels?.nodes?.map((l) => l.name) ?? [];
+
+  return { tipOid, tipLabels };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -157,9 +174,9 @@ async function main() {
 
     console.log(`Merge queue event — detecting tip for branch: ${branch}`);
 
-    let tipOid;
+    let tipOid, tipLabels;
     try {
-      tipOid = await fetchQueueTip(owner, repoName, branch);
+      ({ tipOid, tipLabels } = await fetchQueueTip(owner, repoName, branch));
       console.log(`Queue tip OID: ${tipOid}`);
     } catch (err) {
       console.warn(`WARNING: Failed to fetch queue tip: ${err.message}`);
@@ -173,8 +190,16 @@ async function main() {
     setSummaryTable(sha, tipOid, isTip);
 
     if (isTip) {
-      console.log("This entry IS the queue tip — running full suite");
-      setOutputs("tier-2", TIER2, "mq-tip");
+      // ci/skip lets a contributor opt the tip PR out of heavy CI (e.g. a
+      // docs-only change that happens to land as queue tip). Only checked
+      // for the tip, since non-tip entries already skip the full suite.
+      if (tipLabels.includes("ci/skip")) {
+        console.log("This entry IS the queue tip, but ci/skip is set — cheap checks only");
+        setOutputs("tier-0", TIER0, "tip-ci-skip-label");
+      } else {
+        console.log("This entry IS the queue tip — running full suite");
+        setOutputs("tier-2", TIER2, "mq-tip");
+      }
     } else {
       console.log(`This entry is NOT the queue tip (tip=${tipOid}) — cheap checks only`);
       setOutputs("tier-0", TIER0, "mq-not-tip");

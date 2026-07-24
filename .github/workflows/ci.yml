@@ -36,12 +36,13 @@ jobs:
   # as passing for required-checks purposes.
   #
   # Decision table:
-  #   merge_group + tip of queue:    tier-2  (full suite)
-  #   merge_group + not tip:         tier-0  (cheap only — wait for tip)
-  #   merge_group + API failure:     tier-2  (fail-safe: assume tip)
-  #   workflow_dispatch / ci/merge:  tier-2
-  #   PR with ci/tier-1 label:       tier-1  (build matrix, no integration)
-  #   plain PR:                      tier-0
+  #   merge_group + tip of queue:          tier-2  (full suite)
+  #   merge_group + tip + ci/skip label:   tier-0  (contributor opt-out)
+  #   merge_group + not tip:               tier-0  (cheap only — wait for tip)
+  #   merge_group + API failure:           tier-2  (fail-safe: assume tip)
+  #   workflow_dispatch / ci/merge:         tier-2
+  #   PR with ci/tier-1 label:              tier-1  (build matrix, no integration)
+  #   plain PR:                             tier-0
   #
   # See .github/scripts/compute-ci-level.mjs for the GraphQL tip-detection logic.
   compute-ci-level:
