@@ -47,6 +47,13 @@ Three tiers of jobs run depending on context:
 | 1 | `build` matrix | `ci/tier-1` labeled PRs; `ci/merge`; forced runs; merge queue tip |
 | 2 | `test-integration` matrix | Merge queue tip only (or forced) |
 
+The tip can opt out of tier-2 with the `ci/skip` label (e.g. a docs-only change
+that happens to land as queue tip) — it then runs tier-0 only, same as a
+non-tip entry. `ci/skip` only affects the merge queue; on a plain PR event it
+has no effect. If a PR carries both `ci/merge` (for early feedback) and
+`ci/skip`, it gets the full suite on the PR itself but not once it's the
+merge-queue tip.
+
 The `compute-ci-level` job queries the GitHub GraphQL API to detect whether the current
 merge queue entry is the tip, then sets the `build_os_matrix` and `integration_os_matrix`
 outputs that downstream jobs gate on. Jobs with an empty matrix are skipped, and GitHub
@@ -130,7 +137,8 @@ All safe:
 
 1. **Merge queue**: Settings → Merge queue → Grouping strategy: **ALLGREEN**
 2. **Required status check**: Settings → Rules → Required status checks → add `required-checks`
-3. **Labels**: Create `ci/merge` (triggers full tier-2 on a PR) and `ci/tier-1` (tier-1 only)
+3. **Labels**: Create `ci/merge` (triggers full tier-2 on a PR), `ci/tier-1` (tier-1 only),
+   and `ci/skip` (skip tier-2 even at merge queue tip)
 
 ## Adapting this to your project
 
