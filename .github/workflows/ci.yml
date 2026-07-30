@@ -8,10 +8,13 @@ name: CI
 #   tier-1  build matrix          — ci/tier-1 label, ci/merge label, merge queue tip
 #   tier-2  test-integration      — merge queue tip only (or forced)
 #
-# Non-tip queue entries run tier-0 only, then wait for the tip to pass the
-# full suite under ALLGREEN before anything merges.
-#
-# REQUIREMENT: merge queue must use ALLGREEN grouping, not HEADMERGE.
+# WARNING: This entire tip-detection design is fundamentally UNSAFE.
+# Skipping heavy CI for non-tip entries reports "Success" for their commit SHA.
+# Under ALLGREEN, non-tip entries merge immediately without waiting for the tip.
+# Under HEADGREEN, if the tip fails and is evicted, the non-tip entry becomes
+# the new head and merges on its existing cheap-only "Success."
+# Neither grouping strategy prevents under-tested code from merging.
+# Do not use this in production.
 
 permissions:
   actions: read
@@ -35,7 +38,13 @@ jobs:
   # An empty matrix ("[]") causes the downstream job to be skipped, which counts
   # as passing for required-checks purposes.
   #
-  # Decision table:
+  # WARNING: This entire tip-detection design is fundamentally UNSAFE and should
+  # not be used. Skipping heavy CI for non-tip entries reports a definitive "Success"
+  # status for their merge commit SHA. Under ALLGREEN, these entries merge immediately
+  # (before the tip even finishes). Under HEADGREEN, they merge after the tip fails
+  # and is evicted. Either way, under-tested code reaches the main branch.
+  #
+  # Decision table (historically, now known to be unsafe):
   #   merge_group + tip of queue:          tier-2  (full suite)
   #   merge_group + tip + ci/skip label:   tier-0  (contributor opt-out)
   #   merge_group + not tip:               tier-0  (cheap only — wait for tip)
